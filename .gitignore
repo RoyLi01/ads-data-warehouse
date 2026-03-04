@@ -5,6 +5,8 @@ __pycache__/
 # local warehouse landing (parquet partition dirs)
 warehouse/*
 !warehouse/.gitkeep
+!warehouse/__init__.py
+!warehouse/*.py
 
 # generated raw csv
 data_generator/output/

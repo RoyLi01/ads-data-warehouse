@@ -75,6 +75,29 @@ flowchart LR
   - **粒度**：`dt + conv_id`
   - **用途**：转化明细（去重、时间标准化、GMV 类型统一），复用到转化/营收分析
 
+### DWD v2（明细增强 + 维表落盘，v1/v2 并存）
+
+本项目保留 **DWD v1**（最小链路、兼容现有 DWS/ADS），同时新增 **DWD v2**（更贴近真实埋点/建模）。
+
+- **为什么 v1/v2 并存**
+  - **兼容性**：已有下游（DWS/ADS）基于 v1 字段与口径，直接改动会破坏已有产出。
+  - **渐进升级**：生产中常见“平滑迁移”做法，先并行产出 v2，验证口径与稳定性后再逐步切换下游。
+
+- **v2 明细表（新增，不影响 v1）**
+  - `dwd_ad_impression_detail_v2`（粒度：dt+event_id，过滤 `is_valid=1`，补齐广告/广告位维度）
+  - `dwd_ad_click_detail_v2`（粒度：dt+event_id，过滤 `is_valid=1`，补齐广告/广告位维度）
+  - `dwd_ad_conversion_detail_v2`（粒度：dt+conv_id，补齐广告维度）
+
+`dwd_ad_impression_detail_v2 / dwd_ad_click_detail_v2` 字段（核心字段，按需可再扩展）：
+`event_id,event_time,dt,user_id,session_id,ad_id,campaign_id,creative_id,advertiser_id,ad_type,landing_type,product_id,site_id,page_id,ad_slot_id,slot_type,app,position,price_factor,device,user_agent,ip,event_type`
+
+- **DWD 维表/配置表落盘（每日快照 dt 分区）**
+  - `dwd/dim/dwd_dim_user`：来自 `ods_user_profile.csv`（主键 user_id 去重）
+  - `dwd/dim/dwd_dim_ad`：来自 `ods_ad_meta.csv`（主键 ad_id 去重）
+  - `dwd/dim/dwd_dim_ad_slot`：来自 `ods_ad_slot.csv`（主键 ad_slot_id 去重）
+
+维表选择 **按 dt 分区的每日快照**，原因是与事实表分区方式一致，支持“按天回放/重跑/点时间 join”，也更符合离线数仓习惯。
+
 ### DWS（汇总层）
 
 - **dws_ad_campaign_stats_1d**
@@ -157,6 +180,14 @@ PYTHONPATH=. python spark/jobs/00_ingest_ods.py
 PYTHONPATH=. python spark/jobs/01_build_dwd.py
 ```
 
+### 8.4.1 构建 DWD v2（仅增强 DWD，不影响 v1）
+
+`DWD v2` 从 `data/ods/` 的 CSV 读取（优先 dt 分区目录，回退根目录 CSV），输出到 `warehouse/dwd/`：
+
+```bash
+python -m warehouse.01_build_dwd --dt 2026-03-01
+```
+
 ### 8.5 构建 DWS 汇总（DWD → DWS，含倾斜处理）
 
 ```bash
@@ -179,7 +210,22 @@ python data_generator/generate_ads_ods.py --start_dt 2026-03-01 --days 3 \
 && PYTHONPATH=. python spark/jobs/03_build_ads.py --top_n 10 --rank_by clicks
 ```
 
-## 9. 数据落地目录约定（模拟 Hive 分区）
+## 9. 一键运行（run_all.sh）
+
+如果你的环境已安装 Spark 且 `spark-submit` 可用，可以直接一键跑完整链路（生成数据 → ODS → DWD → DWS → ADS → DQ）：
+
+```bash
+bash run_all.sh
+```
+
+如果你想直接执行，也可以：
+
+```bash
+chmod +x run_all.sh
+./run_all.sh
+```
+
+## 10. 数据落地目录约定（模拟 Hive 分区）
 
 ```text
 warehouse/
@@ -196,7 +242,7 @@ warehouse/
   ads/ads_funnel_daily/dt=YYYY-MM-DD/part-*.parquet
 ```
 
-## 10. 示例查询（spark.sql）
+## 11. 示例查询（spark.sql）
 
 在项目根目录执行下面这段脚本（会读取 Parquet 并用 SQL 查询）：
 
@@ -245,7 +291,7 @@ spark.stop()
 PY
 ```
 
-## 11. 结果展示（ads_campaign_daily_report 截图占位）
+## 12. 结果展示（ads_campaign_daily_report 截图占位）
 
 把 `ads_campaign_daily_report` 的查询结果截图放到下面路径即可（占位）：
 
@@ -255,7 +301,7 @@ docs/screenshots/ads_campaign_daily_report_sample.png
 
 ![ads_campaign_daily_report sample](docs/screenshots/ads_campaign_daily_report_sample.png)
 
-## 12. 后续可扩展方向（留给你后续 prompt 驱动）
+## 13. 后续可扩展方向（留给你后续 prompt 驱动）
 
 - **更真实的业务口径**：如曝光去重、点击归因、转化窗口、投放状态变更、预算消耗逻辑等。
 - **慢变维（SCD）**：将 `campaign` 维度做成拉链表（SCD2）。
