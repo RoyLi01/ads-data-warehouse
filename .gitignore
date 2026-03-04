@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# local warehouse landing (parquet partition dirs)
+warehouse/*
+!warehouse/.gitkeep
+
+# generated raw csv
+data_generator/output/
+
+# generated ods csv (new spec)
+data/ods/
+
