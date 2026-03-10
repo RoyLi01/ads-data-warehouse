@@ -1,310 +1,313 @@
-## 广告数仓离线项目（本地 Spark / Parquet / dt 分区目录）
+# Offline Ad Data Warehouse with Hive Metastore, Spark SQL, and PySpark
 
-## 1. 项目介绍
+A local offline advertising analytics warehouse built with `Hive Metastore + Spark SQL + PySpark + Parquet`.
 
-- **目标**：用本地 Spark（PySpark + Spark SQL/DF）实现一个贴合国内大数据/数仓岗位的广告数仓离线项目，分层 **ODS → DWD → DWS → ADS**。
-- **存储**：统一使用 **Parquet**，用 `dt=YYYY-MM-DD` 的分区目录模拟 Hive 分区表。
-- **特点**：内置一个明显“热点 campaign”（数据量远大于其它），用于演示广告场景常见的数据倾斜与治理。
+This project models a realistic ad-data pipeline from raw event ingestion to reporting outputs through a classic `ODS -> DWD -> DWS -> ADS` architecture. It includes fact and dimension ingestion, SQL-first warehouse jobs, a user-tagging module, and a reproducible benchmark for data skew and salting-based optimization.
 
-## 2. 分层设计目的（ODS → DWD → DWS → ADS）
+## Highlights
+- Four-layer warehouse architecture: `ODS -> DWD -> DWS -> ADS`
+- Hive Metastore used as the metadata/catalog layer, with Parquet as the physical storage layer
+- SQL-first DWD / DWS / ADS jobs, with Python kept as a lightweight orchestrator
+- Explicit fact and dimension modeling for event, conversion, cost, user, ad, and ad-slot data
+- User tag snapshot pipeline based on daily and rolling 7-day features
+- ADS outputs for KPI overview, campaign ranking, advertiser dashboard, and tag effectiveness
+- Reproducible 20M-row benchmark for campaign-level data skew
+- Salting + two-stage aggregation experiment to mitigate hot-key skew on `campaign_id`
 
-分层的核心价值是 **高内聚、低耦合**：
-- **复用**：DWD/DWS 把公共口径沉淀下来，多个报表/应用（ADS）复用，避免每个需求都从事件级明细重复计算。
-- **口径统一**：指标（例如 CTR/CVR/ROI）在 DWS/ADS 统一定义，避免“同名不同口径”。
-- **抗变化**：上游字段/源表变化尽量局部消化在 ODS/DWD，不让变更层层扩散。
+## Tech Stack
+- Python
+- PySpark
+- Spark SQL
+- Hive Metastore (embedded Derby for local development)
+- Parquet
+- Local Spark (`local[*]`)
+- Benchmark / skew experiment tooling under `benchmark/`
 
-- **ODS（原始层）**：承接源数据，主要做类型标准化与分区落地，保证可追溯/可重跑。
-- **DWD（明细层）**：对原始数据做清洗（去重、裁剪、时间标准化等），形成稳定的事实明细底座。
-- **DWS（汇总层）**：面向分析域沉淀公共聚合（按天、按计划、按广告等），统一口径并降低下游计算成本。
-- **ADS（应用层）**：面向消费端（日报、榜单、漏斗等）产出直接可用的报表数据。
-
-## 3. 分层架构图
-
-```mermaid
-flowchart LR
-  A[数据生成<br/>ODS CSV<br/>data/ods/*.csv] --> B[ODS 落地<br/>Parquet 分区<br/>warehouse/ods/*/dt=...]
-  B --> C[DWD 明细<br/>warehouse/dwd/*/dt=...]
-  C --> D[DWS 汇总<br/>warehouse/dws/*/dt=...]
-  D --> E[ADS 指标<br/>warehouse/ads/*/dt=...]
-```
-
-## 4. 目录结构
+## Project Architecture
 
 ```text
-.
-├── data_generator/
-│   └── generate_ads_ods.py
-├── data/
-│   └── ods/                    # ODS CSV（已 gitignore）
-├── spark/
-│   ├── common/
-│   │   └── spark_session.py
-│   └── jobs/
-│       ├── 00_ingest_ods.py
-│       ├── 01_build_dwd.py
-│       ├── 02_build_dws.py
-│       └── 03_build_ads.py
-├── warehouse/                  # Parquet 落地（已 gitignore）
-├── requirements.txt
-└── README.md
+Raw CSV generator
+  ↓
+ODS
+  ↓
+DWD
+  ↓
+DWS
+  ↓
+ADS
 ```
 
-## 5. 表清单（每层 2-3 张表：表名 / 粒度 / 用途）
+### ODS
+- Ingests raw fact CSVs into partitioned Parquet under `warehouse/ods/...`
+- Registers ODS facts and dimensions into the `ods` Hive database
+- Stores:
+  - event log
+  - conversion log
+  - campaign cost
+  - user profile
+  - ad metadata
+  - ad slot metadata
 
-### ODS（原始层）
+### DWD
+- Cleans and standardizes raw ODS inputs
+- Deduplicates facts, filters invalid traffic, and normalizes event / conversion timestamps
+- Enriches facts with business dimensions such as advertiser, ad type, landing type, product, and slot metadata
+- Produces dimension snapshots and detail facts:
+  - user dimension
+  - ad dimension
+  - ad-slot dimension
+  - impression detail
+  - click detail
+  - conversion detail
+  - campaign-day cost
 
-- **ad_event_log**：曝光/点击事件日志（按 dt 分区）
-  - **粒度**：`dt + event_id`
-  - **用途**：事件级事实来源（曝光/点击），承接广告投放的主要行为数据
-- **conversion_log**：转化日志（按 dt 分区）
-  - **粒度**：`dt + conv_id`
-  - **用途**：订单/GMV 的转化事实来源，支撑转化率与 ROI
-- **ad_cost**：投放成本（按 dt+campaign_id 汇总，按 dt 分区）
-  - **粒度**：`dt + campaign_id`
-  - **用途**：成本侧口径（消耗），供 DWS/ADS 关联补齐 cost
+### DWS
+- Builds daily subject-area aggregates on top of DWD
+- Standardizes campaign, advertiser, and user metrics such as `impressions`, `clicks`, `conversions`, `gmv`, `cost`, `ctr`, `cvr`, `rpm`, and `roi`
+- Adds a user-tagging module:
+  - static tag dictionary
+  - daily user tag snapshot
+  - daily tag quality table
 
-### DWD（明细层）
+### ADS
+- Produces reporting-friendly outputs from DWS
+- Includes:
+  - KPI overview
+  - campaign ranking
+  - advertiser dashboard
+  - tag effectiveness report
 
-- **dwd_ad_impression_detail**
-  - **粒度**：`dt + event_id`
-  - **用途**：曝光明细（去重、时间标准化、字段裁剪），复用到曝光侧各类分析
-- **dwd_ad_click_detail**
-  - **粒度**：`dt + event_id`
-  - **用途**：点击明细（去重、时间标准化、字段裁剪），复用到点击侧分析与归因
-- **dwd_ad_conversion_detail**
-  - **粒度**：`dt + conv_id`
-  - **用途**：转化明细（去重、时间标准化、GMV 类型统一），复用到转化/营收分析
+## Main Tables
 
-### DWD v2（明细增强 + 维表落盘，v1/v2 并存）
+### ODS
+| Table | Grain | Purpose |
+|---|---|---|
+| `ods.ad_event_log` | `dt + event_id` | Raw impression / click event stream landed to Parquet and Hive |
+| `ods.conversion_log` | `dt + conv_id` | Conversion facts with order and GMV information |
+| `ods.ad_cost` | `dt + campaign_id` | Daily campaign cost input for downstream ROI/cost analysis |
+| `ods.user_profile` | `user_id` | User dimension source with demographics and registration date |
+| `ods.ad_meta` | `ad_id + campaign_id` | Ad metadata source with advertiser, ad type, landing type, and product |
+| `ods.ad_slot` | `ad_slot_id` | Ad slot / placement metadata |
 
-本项目保留 **DWD v1**（最小链路、兼容现有 DWS/ADS），同时新增 **DWD v2**（更贴近真实埋点/建模）。
+### DWD
+| Table | Grain | Purpose |
+|---|---|---|
+| `dwd.dim_user` | `dt + user_id` | Daily user dimension snapshot |
+| `dwd.dim_ad` | `dt + ad_id + campaign_id` | Daily ad dimension snapshot aligned to fact enrichment grain |
+| `dwd.dim_ad_slot` | `dt + ad_slot_id` | Daily ad-slot dimension snapshot |
+| `dwd.ad_impression_detail` | `dt + event_id` | Cleaned and enriched impression facts |
+| `dwd.ad_click_detail` | `dt + event_id` | Cleaned and enriched click facts |
+| `dwd.ad_conversion_detail` | `dt + conv_id` | Cleaned and enriched conversion facts |
+| `dwd.campaign_day_cost` | `dt + campaign_id` | Standardized campaign-day cost table for DWS cost aggregation |
 
-- **为什么 v1/v2 并存**
-  - **兼容性**：已有下游（DWS/ADS）基于 v1 字段与口径，直接改动会破坏已有产出。
-  - **渐进升级**：生产中常见“平滑迁移”做法，先并行产出 v2，验证口径与稳定性后再逐步切换下游。
+### DWS
+| Table | Grain | Purpose |
+|---|---|---|
+| `dws.campaign_daily` | `dt + campaign_id` | Daily campaign metrics for performance analysis |
+| `dws.advertiser_daily` | `dt + advertiser_id` | Daily advertiser aggregates for dashboarding |
+| `dws.user_daily` | `dt + user_id` | Daily user behavior aggregate |
+| `dws.user_tag_snapshot` | `dt + user_id` | User tag snapshot built from same-day and 7-day rolling features |
+| `dws.tag_quality_daily` | `dt + tag_name` | Daily tag coverage and effectiveness metrics |
+| `dws.tag_dict` | `tag_id` | Built-in tag dictionary and rule definitions |
 
-- **v2 明细表（新增，不影响 v1）**
-  - `dwd_ad_impression_detail_v2`（粒度：dt+event_id，过滤 `is_valid=1`，补齐广告/广告位维度）
-  - `dwd_ad_click_detail_v2`（粒度：dt+event_id，过滤 `is_valid=1`，补齐广告/广告位维度）
-  - `dwd_ad_conversion_detail_v2`（粒度：dt+conv_id，补齐广告维度）
+### ADS
+| Table | Grain | Purpose |
+|---|---|---|
+| `ads.kpi_overview_daily` | `dt` | Executive KPI overview of traffic, conversion, GMV, cost, and ROI |
+| `ads.campaign_ranking_daily` | `dt + campaign_id` | Campaign leaderboard by GMV and ROI |
+| `ads.advertiser_dashboard_daily` | `dt + advertiser_id` | Advertiser dashboard with growth and retention indicators |
+| `ads.tag_effectiveness_daily` | `dt + tag_name` | Tag-level effectiveness summary |
 
-`dwd_ad_impression_detail_v2 / dwd_ad_click_detail_v2` 字段（核心字段，按需可再扩展）：
-`event_id,event_time,dt,user_id,session_id,ad_id,campaign_id,creative_id,advertiser_id,ad_type,landing_type,product_id,site_id,page_id,ad_slot_id,slot_type,app,position,price_factor,device,user_agent,ip,event_type`
+## Key Modules
 
-- **DWD 维表/配置表落盘（每日快照 dt 分区）**
-  - `dwd/dim/dwd_dim_user`：来自 `ods_user_profile.csv`（主键 user_id 去重）
-  - `dwd/dim/dwd_dim_ad`：来自 `ods_ad_meta.csv`（主键 ad_id 去重）
-  - `dwd/dim/dwd_dim_ad_slot`：来自 `ods_ad_slot.csv`（主键 ad_slot_id 去重）
+### Fact and Dimension Modeling
+- `jobs/ingest_ods.py` lands ODS fact tables to partitioned Parquet and registers them in Hive.
+- `jobs/ingest_ods_dims.py` ingests user / ad / ad-slot dimensions into the ODS layer.
+- `jobs/build_dwd.py` is SQL-dominant and converts ODS data into cleaned, enriched warehouse facts and dimension snapshots.
 
-维表选择 **按 dt 分区的每日快照**，原因是与事实表分区方式一致，支持“按天回放/重跑/点时间 join”，也更符合离线数仓习惯。
+### User Tagging Module
+- Implemented inside `jobs/build_dws.py`
+- Uses both daily features and rolling 7-day features
+- Produces:
+  - `dws.tag_dict`
+  - `dws.user_tag_snapshot`
+  - `dws.tag_quality_daily`
 
-### DWS（汇总层）
+### Reporting Layer
+- `jobs/build_ads.py` generates dashboard-ready outputs from DWS
+- Covers overview KPIs, campaign ranking, advertiser reporting, and tag effectiveness analysis
 
-- **dws_ad_campaign_stats_1d**
-  - **粒度**：`dt + campaign_id`
-  - **用途**：计划日公共汇总（imps/clicks/convs/gmv/cost），支撑计划日报与看板
-- **dws_ad_ad_stats_1d**
-  - **粒度**：`dt + ad_id`
-  - **用途**：广告日公共汇总（imps/clicks/convs/gmv），支撑广告维度分析与榜单
+## Data Skew Benchmark
 
-### ADS（应用层）
+The project includes a standalone benchmark under `benchmark/` to reproduce and explain data skew on `campaign_id` aggregation.
 
-- **ads_campaign_daily_report**
-  - **粒度**：`dt + campaign_id`
-  - **用途**：计划日报（含 CTR/CVR/CPC/CPM/ROI/AOV）
-- **ads_top_creatives_daily**
-  - **粒度**：`dt + rank`
-  - **用途**：Top10 创意榜（按 clicks 或 roi 排序；从 DWD 按 creative_id 聚合 + 简化归因）
-- **ads_funnel_daily**
-  - **粒度**：`dt`
-  - **用途**：全站漏斗（imps → clicks → convs）
+### Experiment Goal
+Validate how a hot `campaign_id` affects Spark aggregation runtime, partition balance, and resource pressure under a campaign-level aggregation workload similar to DWS.
 
-## 6. 指标口径（CTR/CVR/CPC/CPM/ROI）
+### Experiment Setup
+- Dataset size: `20,000,000` rows per distribution
+- Hot-key setup: one `campaign_id` accounts for roughly `80%` of rows in the skewed dataset
+- Stress benchmark mode:
+  - fixed shuffle partitions
+  - repartition by `campaign_id`
+  - sort within partitions
+  - campaign-level aggregation
 
-- **CTR（Click Through Rate）**：\( CTR = \frac{clicks}{imps} \)
-- **CVR（Conversion Rate, click→conv）**：\( CVR = \frac{convs}{clicks} \)
-- **CPC（Cost Per Click）**：\( CPC = \frac{cost}{clicks} \)
-- **CPM（Cost Per Mille）**：\( CPM = \frac{cost}{imps} \times 1000 \)
-- **ROI（Return On Investment）**：\( ROI = \frac{gmv}{cost} \)
+### Distribution Impact: `uniform` vs `skewed`
 
-说明：分母为 0 时指标记为 `NULL`（避免除零带来的无意义数值）。
+Observed locally with `20M` rows and `shuffle_partitions=4`:
 
-## 7. 数据倾斜：广告场景为什么常见 & 项目里怎么处理
+| Scenario | Elapsed Time | Partition Skew Ratio |
+|---|---:|---:|
+| `uniform` | `36.31s` | `1.14` |
+| `skewed` | `62.67s` | `3.43` |
 
-### 7.1 为什么广告数据倾斜很常见
+- `slowdown_ratio = 1.73`
+- The skewed run also triggered memory-pressure warnings during execution
 
-广告业务天然符合“二八分布/长尾分布”：
-- 少数 **热点 campaign/creative** 承接了大部分曝光与点击（爆款素材、加大预算、平台流量倾斜）。
-- 头部媒体/点位流量集中，进一步放大某些 key 的数据量。
+### Skew Mitigation: `skewed` vs `skewed_salted`
 
-在 Spark 里表现为：聚合/Join 的某些 key 数据量极大，容易产生 **straggler**（拖后腿的任务），导致作业整体被最慢的分区决定。
+The benchmark also includes a salted version of the skewed aggregation:
 
-### 7.2 本项目的处理方法（可面试讲解）
+- Input is still the same `skewed` dataset
+- The hot `campaign_id` is split into multiple salted sub-keys
+- Aggregation is executed in two stages:
+  1. `dt + campaign_id + salt`
+  2. `dt + campaign_id`
 
-- **salting + 两阶段聚合（已实现）**
-  - 位置：`spark/jobs/02_build_dws.py`
-  - 思路：对热点 key（例如 `campaign_id=cmp_hot_0001`）加盐 `_salt`，把一个大 group 拆成 N 个小 group 并行做局部聚合，再二次汇总回原 key。
-  - 收益：拆分热点、降低单点聚合压力，显著减少拖尾。
-- **broadcast join（已实现/可选）**
-  - 位置：`spark/jobs/02_build_dws.py` 将 `ad_cost` 作为小表广播 join（避免大表 join 触发 shuffle）。
-  - 场景：小表（维表/成本表/字典表）+ 大表 join 时常用。
-- **AQE（已开启）**
-  - 位置：`spark/common/spark_session.py` 已开启 AQE（自适应执行：分区合并、skew join 等）。
-  - 收益：根据运行时统计信息动态优化执行计划，提升整体稳定性与性能。
+Observed locally with `20M` rows, `shuffle_partitions=4`, and `salt_buckets=8`:
 
-## 8. 运行步骤（从生成数据到产出 ADS）
+| Scenario | Elapsed Time | Partition Skew Ratio |
+|---|---:|---:|
+| `skewed` | `32.03s` | `3.43` |
+| `skewed_salted` | `23.95s` | `1.80` |
 
-### 8.1 安装依赖
+- `improvement_ratio = 1.34`
+- The salted run materially reduced partition imbalance and improved runtime
 
+### Benchmark Conclusion
+This benchmark shows two important points:
+
+1. A hot `campaign_id` can create strong partition imbalance, long-tail tasks, and higher resource pressure during aggregation.
+2. Salting + two-stage aggregation is an effective mitigation strategy for hot-key skew, even in a local Spark environment.
+
+## How to Run
+
+### 1. Install Dependencies
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 8.2 生成 ODS CSV（至少 3 天）
+### 2. Generate ODS Data
+For a realistic DWS tagging run, generate at least 7 days:
 
 ```bash
-python data_generator/generate_ads_ods.py --start_dt 2026-03-01 --days 3
+python data_generator/generate_ods.py --start_dt 2026-03-01 --days 7
 ```
 
-### 8.3 ODS 落地（CSV → Parquet 分区表）
+### 3. Initialize Hive Metadata
+```bash
+PYTHONPATH=. python jobs/init_hive.py
+```
+
+### 4. Ingest ODS Facts and Dimensions
+```bash
+PYTHONPATH=. python jobs/ingest_ods.py
+PYTHONPATH=. python jobs/ingest_ods_dims.py
+```
+
+### 5. Build DWD and DWS
+If you want correct 7-day user-tag features, run DWD and DWS sequentially by day:
 
 ```bash
-PYTHONPATH=. python spark/jobs/00_ingest_ods.py
+for dt in 2026-03-01 2026-03-02 2026-03-03 2026-03-04 2026-03-05 2026-03-06 2026-03-07; do
+  PYTHONPATH=. python -m jobs.build_dwd --dt "$dt" --no_dq
+  PYTHONPATH=. python -m jobs.build_dws --dt "$dt" --no_dq
+done
 ```
 
-### 8.4 构建 DWD 明细（ODS → DWD）
-
+### 6. Build ADS
 ```bash
-PYTHONPATH=. python spark/jobs/01_build_dwd.py
+PYTHONPATH=. python -m jobs.build_ads --dt 2026-03-07 --no_dq
 ```
 
-### 8.4.1 构建 DWD v2（仅增强 DWD，不影响 v1）
-
-`DWD v2` 从 `data/ods/` 的 CSV 读取（优先 dt 分区目录，回退根目录 CSV），输出到 `warehouse/dwd/`：
-
-```bash
-python -m warehouse.01_build_dwd --dt 2026-03-01
-```
-
-### 8.5 构建 DWS 汇总（DWD → DWS，含倾斜处理）
-
-```bash
-PYTHONPATH=. python spark/jobs/02_build_dws.py --num_salts 16
-```
-
-### 8.6 构建 ADS 报表（DWS/DWD → ADS）
-
-```bash
-PYTHONPATH=. python spark/jobs/03_build_ads.py
-```
-
-一键跑通（从 0 到 ADS）：
-
-```bash
-python data_generator/generate_ads_ods.py --start_dt 2026-03-01 --days 3 \
-&& PYTHONPATH=. python spark/jobs/00_ingest_ods.py \
-&& PYTHONPATH=. python spark/jobs/01_build_dwd.py \
-&& PYTHONPATH=. python spark/jobs/02_build_dws.py --num_salts 16 \
-&& PYTHONPATH=. python spark/jobs/03_build_ads.py --top_n 10 --rank_by clicks
-```
-
-## 9. 一键运行（run_all.sh）
-
-如果你的环境已安装 Spark 且 `spark-submit` 可用，可以直接一键跑完整链路（生成数据 → ODS → DWD → DWS → ADS → DQ）：
+### 7. Optional Smoke Run
+For a quick end-to-end smoke run:
 
 ```bash
 bash run_all.sh
 ```
 
-如果你想直接执行，也可以：
+Note: `run_all.sh` is useful for a single-date smoke test, while the 7-day sequential DWD/DWS run above is recommended when demonstrating rolling user-tag features.
 
+## Benchmark Usage
+
+### Generate Benchmark Data
 ```bash
-chmod +x run_all.sh
-./run_all.sh
+python benchmark/generate_skew_data.py --rows 20000000
 ```
 
-## 10. 数据落地目录约定（模拟 Hive 分区）
+### Run `uniform` / `skewed` / `skewed_salted`
+```bash
+PYTHONPATH=. python benchmark/run_campaign_skew_benchmark.py --modes all --benchmark_mode stress --shuffle_partitions 4 --salt_buckets 8
+```
+
+### Compare Only `skewed` vs `skewed_salted`
+```bash
+PYTHONPATH=. python benchmark/run_campaign_skew_benchmark.py --modes skewed skewed_salted --benchmark_mode stress --shuffle_partitions 4 --salt_buckets 8
+```
+
+### Benchmark Outputs
+- Data: `benchmark/data/...`
+- Aggregation outputs: `benchmark/results/<mode>/campaign_daily_stress`
+- Result files:
+  - `benchmark/results/benchmark_results.csv`
+  - `benchmark/results/benchmark_results.jsonl`
+
+## Repository Structure
 
 ```text
-warehouse/
-  ods/ad_event_log/dt=YYYY-MM-DD/part-*.parquet
-  ods/conversion_log/dt=YYYY-MM-DD/part-*.parquet
-  ods/ad_cost/dt=YYYY-MM-DD/part-*.parquet
-  dwd/dwd_ad_impression_detail/dt=YYYY-MM-DD/part-*.parquet
-  dwd/dwd_ad_click_detail/dt=YYYY-MM-DD/part-*.parquet
-  dwd/dwd_ad_conversion_detail/dt=YYYY-MM-DD/part-*.parquet
-  dws/dws_ad_campaign_stats_1d/dt=YYYY-MM-DD/part-*.parquet
-  dws/dws_ad_ad_stats_1d/dt=YYYY-MM-DD/part-*.parquet
-  ads/ads_campaign_daily_report/dt=YYYY-MM-DD/part-*.parquet
-  ads/ads_top_creatives_daily/dt=YYYY-MM-DD/part-*.parquet
-  ads/ads_funnel_daily/dt=YYYY-MM-DD/part-*.parquet
+.
+├── benchmark/
+│   ├── generate_skew_data.py
+│   ├── run_campaign_skew_benchmark.py
+│   ├── data/
+│   ├── results/
+│   └── tmp/
+├── common/
+│   └── spark_session.py
+├── data/
+│   └── ods/
+├── data_generator/
+│   └── generate_ods.py
+├── docs/
+├── jobs/
+│   ├── init_hive.py
+│   ├── ingest_ods.py
+│   ├── ingest_ods_dims.py
+│   ├── build_dwd.py
+│   ├── build_dws.py
+│   ├── build_ads.py
+│   └── dq_check.py
+├── scripts/
+├── warehouse/
+│   ├── ods/
+│   ├── dwd/
+│   ├── dws/
+│   ├── ads/
+│   ├── hive_warehouse/
+│   └── metastore_db/
+├── requirements.txt
+├── run_all.sh
+└── README.md
 ```
 
-## 11. 示例查询（spark.sql）
-
-在项目根目录执行下面这段脚本（会读取 Parquet 并用 SQL 查询）：
-
-```bash
-PYTHONPATH=. python - <<'PY'
-from pyspark.sql import SparkSession
-
-spark = (
-    SparkSession.builder
-    .appName("ads_sql_demo")
-    .master("local[*]")
-    .getOrCreate()
-)
-
-spark.read.parquet("warehouse/ads/ads_campaign_daily_report").createOrReplaceTempView("ads_campaign_daily_report")
-spark.read.parquet("warehouse/ads/ads_top_creatives_daily").createOrReplaceTempView("ads_top_creatives_daily")
-spark.read.parquet("warehouse/ads/ads_funnel_daily").createOrReplaceTempView("ads_funnel_daily")
-
-dt = "2026-03-01"
-
-print("=== campaign daily report (top by clicks) ===")
-spark.sql(f"""
-select dt,campaign_id,imps,clicks,convs,gmv,cost,ctr,cvr,cpc,cpm,roi,aov
-from ads_campaign_daily_report
-where dt = '{dt}'
-order by clicks desc
-limit 10
-""").show(truncate=False)
-
-print("=== top creatives daily ===")
-spark.sql(f"""
-select dt,rank,creative_id,clicks,ctr,convs,cvr
-from ads_top_creatives_daily
-where dt = '{dt}'
-order by rank asc
-""").show(truncate=False)
-
-print("=== funnel daily ===")
-spark.sql("""
-select *
-from ads_funnel_daily
-order by dt asc
-""").show(truncate=False)
-
-spark.stop()
-PY
-```
-
-## 12. 结果展示（ads_campaign_daily_report 截图占位）
-
-把 `ads_campaign_daily_report` 的查询结果截图放到下面路径即可（占位）：
-
-```text
-docs/screenshots/ads_campaign_daily_report_sample.png
-```
-
-![ads_campaign_daily_report sample](docs/screenshots/ads_campaign_daily_report_sample.png)
-
-## 13. 后续可扩展方向（留给你后续 prompt 驱动）
-
-- **更真实的业务口径**：如曝光去重、点击归因、转化窗口、投放状态变更、预算消耗逻辑等。
-- **慢变维（SCD）**：将 `campaign` 维度做成拉链表（SCD2）。
-- **更多维度**：媒体/计划/单元/创意、地域、设备、用户画像等。
-- **质量与治理**：主键唯一性、空值校验、异常值处理、对账/指标一致性校验。
+## Future Extensions
+- Move from local embedded Hive metastore to a distributed Spark / Hive environment
+- Add richer data-quality checks and reconciliation workflows
+- Extend the warehouse with more business domains, attribution logic, and campaign lifecycle metrics
+- Add more benchmark modes, such as skewed joins or skew-aware window computations
+- Add orchestration and scheduling once the project is migrated beyond local development
 

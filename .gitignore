@@ -14,3 +14,8 @@ data_generator/output/
 # generated ods csv (new spec)
 data/ods/
 
+# benchmark experiment artifacts
+benchmark/data/
+benchmark/results/
+benchmark/tmp/
+

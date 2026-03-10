@@ -4,42 +4,45 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# Ensure local module imports work for spark-submit drivers.
+# Ensure local module imports work.
 export PYTHONPATH="$ROOT_DIR"
 
 # Avoid DNS issues in some environments.
 export SPARK_LOCAL_IP="${SPARK_LOCAL_IP:-127.0.0.1}"
 export SPARK_LOCAL_HOSTNAME="${SPARK_LOCAL_HOSTNAME:-localhost}"
 
-spark_submit() {
-  local script="$1"
+# Speed knobs:
+# - FAST=1: skip expensive DQ/count() prints and skip dq_check
+# - DT/START_DT/DAYS: override default dates
+FAST="${FAST:-0}"
+DT="${DT:-2026-03-01}"
+START_DT="${START_DT:-$DT}"
+DAYS="${DAYS:-3}"
 
-  # Prefer pyspark-bundled spark-submit if available (pip-installed pyspark).
-  local pyspark_submit
-  pyspark_submit="$(python - <<'PY'
-import pathlib
-import pyspark
-print(pathlib.Path(pyspark.__file__).resolve().parent / "bin" / "spark-submit")
-PY
-)"
+python data_generator/generate_ods.py --start_dt "$START_DT" --days "$DAYS"
 
-  local cmd="spark-submit"
-  if [[ -x "$pyspark_submit" ]]; then
-    cmd="$pyspark_submit"
-  fi
+# Initialize Hive databases / external tables first.
+python jobs/init_hive.py
 
-  "$cmd" \
-    --conf "spark.driver.extraPythonPath=$PYTHONPATH" \
-    --conf "spark.executor.extraPythonPath=$PYTHONPATH" \
-    "$script"
-}
+# ODS landing (CSV -> Parquet partitioned tables)
+python jobs/ingest_ods.py
+python jobs/ingest_ods_dims.py
 
-python data_generator/generate_data.py
-spark_submit spark/jobs/00_ingest_ods.py
-spark_submit spark/jobs/01_build_dwd.py
-spark_submit spark/jobs/02_build_dws.py
-spark_submit spark/jobs/03_build_ads.py
-spark_submit spark/jobs/04_data_quality_check.py
+# Official warehouse pipeline (incremental by dt)
+if [[ "$FAST" == "1" ]]; then
+  python jobs/build_dwd.py --dt "$DT" --no_dq
+  python jobs/build_dws.py --dt "$DT" --no_dq
+  python jobs/build_ads.py --dt "$DT" --no_dq
+else
+  python jobs/build_dwd.py --dt "$DT"
+  python jobs/build_dws.py --dt "$DT"
+  python jobs/build_ads.py --dt "$DT"
+fi
+
+# Data quality checks on the official pipeline outputs
+if [[ "$FAST" != "1" ]]; then
+  python jobs/dq_check.py --dt "$DT"
+fi
 
 echo "All done."
 

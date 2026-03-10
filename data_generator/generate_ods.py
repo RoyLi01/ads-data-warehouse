@@ -1,5 +1,41 @@
 from __future__ import annotations
 
+"""
+Generate mock ODS CSVs (tracking-log-like + dims/config tables).
+
+This is the single official ODS generator of the project.
+
+Main outputs (default under `data/ods/`):
+
+- `ods_ad_event_log.csv` (+ `dt=.../ods_ad_event_log.csv`)
+  - **Grain**: 1 row per event (impression / click)
+  - **How**:
+    - Generate impressions with a hot campaign (skew)
+    - Derive clicks by sampling impressions (per-campaign CTR)
+    - Derive session_id by sessionization within (dt, user_id) with 30-min gap rule
+    - Derive ad_slot_id/page_id/user_agent/ip as random enrichments
+    - Derive is_valid with different invalid rates for click vs impression
+
+- `ods_conversion_log.csv` (+ `dt=.../ods_conversion_log.csv`)
+  - **Grain**: 1 row per conversion (treated as 1 purchase/order)
+  - **How**: sample from clicks (per-campaign CVR), conv_time = click_time + delay, GMV ~ lognormal
+
+- `ods_ad_cost.csv` (+ `dt=.../ods_ad_cost.csv`)
+  - **Grain**: 1 row per (dt, campaign_id)
+  - **How**: simple CPM+CPC pricing + small noise
+
+- `ods_user_profile.csv`
+  - **Grain**: 1 row per user_id (only users that appear in event_log)
+
+- `ods_ad_meta.csv`
+  - **Grain**: 1 row per (ad_id, campaign_id) pair appearing in event_log
+  - **Includes**: advertiser_id/ad_type/landing_type/product_id/start_dt/end_dt
+
+- `ods_ad_slot.csv`
+  - **Grain**: 1 row per ad_slot_id (slot_001..slot_020)
+  - **Includes**: slot_type/app/position/price_factor
+"""
+
 import argparse
 import hashlib
 import math
@@ -36,7 +72,8 @@ def _fmt_dt(d: datetime) -> str:
 
 
 def _stable_int(s: str) -> int:
-    # Stable hash across runs/platforms (avoid Python's salted hash)
+    # Stable hash across runs/platforms (avoid Python's salted hash()).
+    # Used for mapping campaign_id -> advertiser_id deterministically.
     h = hashlib.md5(s.encode("utf-8")).hexdigest()
     return int(h[:8], 16)
 
@@ -78,8 +115,8 @@ def _campaign_cvr_map(rng: np.random.Generator, campaign_ids: Iterable[str], cvr
 def _campaign_pricing_map(rng: np.random.Generator, campaign_ids: Iterable[str]) -> Dict[str, CampaignPricing]:
     mp: Dict[str, CampaignPricing] = {}
     for cid in campaign_ids:
-        cpm = float(rng.uniform(10.0, 60.0))  # RMB per 1000 impressions
-        cpc = float(rng.uniform(0.2, 2.0))    # RMB per click
+        cpm = float(rng.uniform(10.0, 60.0))
+        cpc = float(rng.uniform(0.2, 2.0))
         mp[cid] = CampaignPricing(cpm=cpm, cpc=cpc)
     return mp
 
@@ -91,22 +128,21 @@ def _allocate_impressions(
     hot_campaign_id: str,
     hot_share: float,
 ) -> List[Tuple[str, int]]:
-    if total_imps <= 0:
-        return []
     if hot_campaign_id not in campaign_ids:
         raise ValueError("hot_campaign_id must be included in campaign_ids")
-
     hot_imps = int(round(total_imps * hot_share))
-    hot_imps = max(1, min(total_imps, hot_imps))
-    rest = total_imps - hot_imps
+    hot_imps = min(max(hot_imps, 0), total_imps)
+    rest = int(total_imps - hot_imps)
 
     others = [c for c in campaign_ids if c != hot_campaign_id]
     if not others:
         return [(hot_campaign_id, total_imps)]
 
+    # distribute remaining impressions across other campaigns (small + random)
     weights = rng.random(len(others))
     weights = weights / weights.sum()
     alloc = (weights * rest).astype(int)
+    # fix rounding drift
     drift = rest - int(alloc.sum())
     if drift != 0:
         idx = rng.integers(0, len(alloc), size=abs(drift))
@@ -134,10 +170,9 @@ def _gen_event_log_for_day(
     user_id_max: int,
     starting_event_seq: int,
 ) -> Tuple[pd.DataFrame, int]:
-    alloc = _allocate_impressions(
-        rng, total_imps=total_imps, campaign_ids=campaign_ids, hot_campaign_id=hot_campaign_id, hot_share=hot_share
-    )
+    alloc = _allocate_impressions(rng, total_imps=total_imps, campaign_ids=campaign_ids, hot_campaign_id=hot_campaign_id, hot_share=hot_share)
 
+    # Build impression rows campaign by campaign (keeps hot campaign skew obvious)
     imp_parts: List[pd.DataFrame] = []
     seq = starting_event_seq
 
@@ -163,23 +198,8 @@ def _gen_event_log_for_day(
         )
         imp_parts.append(imp_df)
 
-    impressions = (
-        pd.concat(imp_parts, ignore_index=True)
-        if imp_parts
-        else pd.DataFrame(
-            columns=[
-                "event_id",
-                "event_time",
-                "dt",
-                "user_id",
-                "ad_id",
-                "campaign_id",
-                "creative_id",
-                "site_id",
-                "event_type",
-                "device",
-            ]
-        )
+    impressions = pd.concat(imp_parts, ignore_index=True) if imp_parts else pd.DataFrame(
+        columns=["event_id", "event_time", "dt", "user_id", "ad_id", "campaign_id", "creative_id", "site_id", "event_type", "device"]
     )
 
     # Sample clicks from impressions using campaign-level CTR (overall ~1%-5%)
@@ -194,6 +214,7 @@ def _gen_event_log_for_day(
         clk_ids = [f"evt_clk_{dt.replace('-', '')}_{seq + i:010d}" for i in range(len(clicked))]
         seq += len(clicked)
         clicked["event_id"] = clk_ids
+        # click happens shortly after impression
         add_secs = rng.integers(1, 301, size=len(clicked), endpoint=False)
         clicked["event_time"] = [
             _add_seconds(t, int(s)) for t, s in zip(clicked["event_time"].tolist(), add_secs.tolist())
@@ -212,27 +233,28 @@ def _gen_conversions(
     max_delay_minutes: int,
 ) -> Tuple[pd.DataFrame, int]:
     clicks = event_log[event_log["event_type"] == "click"].copy()
-    cols = ["conv_id", "conv_time", "dt", "user_id", "ad_id", "campaign_id", "order_id", "gmv_amount"]
     if len(clicks) == 0:
+        cols = ["conv_id", "conv_time", "dt", "user_id", "ad_id", "campaign_id", "order_id", "gmv_amount"]
         return pd.DataFrame(columns=cols), starting_conv_seq
 
     p = clicks["campaign_id"].map(cvr_map).astype(float).to_numpy()
     conv_mask = rng.random(len(clicks)) < p
     conv_clicks = clicks.loc[conv_mask].copy()
+
     if len(conv_clicks) == 0:
+        cols = ["conv_id", "conv_time", "dt", "user_id", "ad_id", "campaign_id", "order_id", "gmv_amount"]
         return pd.DataFrame(columns=cols), starting_conv_seq
 
-    conv_ids = [
-        f"conv_{c.replace('-', '')}_{starting_conv_seq + i:010d}"
-        for i, c in enumerate(conv_clicks["dt"].tolist())
-    ]
+    conv_ids = [f"conv_{c.replace('-', '')}_{starting_conv_seq + i:010d}" for i, c in enumerate(conv_clicks["dt"].tolist())]
     seq = starting_conv_seq + len(conv_clicks)
 
     delays = rng.integers(1, max_delay_minutes + 1, size=len(conv_clicks), endpoint=True)
     conv_times = [_add_minutes(t, int(m)) for t, m in zip(conv_clicks["event_time"].tolist(), delays.tolist())]
 
+    # gmv: right-skewed distribution (more realistic than uniform).
     gmv = rng.lognormal(mean=math.log(80), sigma=0.7, size=len(conv_clicks))
     gmv = np.clip(gmv, 5, 5000)
+
     order_ids = [f"ord_{starting_conv_seq + i:012d}" for i in range(len(conv_clicks))]
 
     conv_df = pd.DataFrame(
@@ -250,7 +272,11 @@ def _gen_conversions(
     return conv_df, seq
 
 
-def _gen_cost(rng: np.random.Generator, event_log: pd.DataFrame, pricing_map: Dict[str, CampaignPricing]) -> pd.DataFrame:
+def _gen_cost(
+    rng: np.random.Generator,
+    event_log: pd.DataFrame,
+    pricing_map: Dict[str, CampaignPricing],
+) -> pd.DataFrame:
     imps = event_log[event_log["event_type"] == "impression"].groupby(["dt", "campaign_id"], as_index=False).size()
     clks = event_log[event_log["event_type"] == "click"].groupby(["dt", "campaign_id"], as_index=False).size()
 
@@ -267,6 +293,7 @@ def _gen_cost(rng: np.random.Generator, event_log: pd.DataFrame, pricing_map: Di
 
     merged["cost"] = merged.apply(_row_cost, axis=1)
     merged["cost"] = merged["cost"].round(4)
+
     return merged[["dt", "campaign_id", "cost"]].sort_values(["dt", "campaign_id"]).reset_index(drop=True)
 
 
@@ -287,6 +314,7 @@ def _user_agent_from_device_type(device_type: str) -> str:
 
 
 def _gen_ipv4(rng: np.random.Generator, n: int) -> pd.Series:
+    # "Looks like IPv4" is enough for demo; no need to model real distributions.
     a = rng.integers(1, 223, size=n)
     b = rng.integers(0, 255, size=n)
     c = rng.integers(0, 255, size=n)
@@ -295,7 +323,8 @@ def _gen_ipv4(rng: np.random.Generator, n: int) -> pd.Series:
 
 
 def _add_session_id(event_log: pd.DataFrame) -> pd.Series:
-    # session split: within same dt/user, gap > 30 minutes => new session
+    # Sessionization rule:
+    # within the same (dt, user_id), sort by event_time; if gap > 30 minutes => start a new session.
     tmp = event_log[["dt", "user_id", "event_time"]].copy()
     tmp["event_time_ts"] = pd.to_datetime(tmp["event_time"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
     tmp = tmp.sort_values(["dt", "user_id", "event_time_ts"], kind="mergesort")
@@ -314,6 +343,7 @@ def _add_session_id(event_log: pd.DataFrame) -> pd.Series:
 
 
 def _gen_user_profile(rng: np.random.Generator, event_log: pd.DataFrame, start_dt: str) -> pd.DataFrame:
+    # Only generate profiles for users that actually appear in the event log.
     users = event_log[["user_id", "device"]].copy()
     users["device_type"] = users["device"].map(_device_type_from_device)
 
@@ -348,6 +378,7 @@ def _gen_user_profile(rng: np.random.Generator, event_log: pd.DataFrame, start_d
 
 
 def _gen_ad_meta(rng: np.random.Generator, event_log: pd.DataFrame, start_dt: str, end_dt: str) -> pd.DataFrame:
+    # Use (ad_id, campaign_id) as the grain (closer to real-world: the same ad_id can be reused).
     pairs = event_log[["ad_id", "campaign_id"]].drop_duplicates().reset_index(drop=True)
     n = len(pairs)
 
@@ -358,9 +389,26 @@ def _gen_ad_meta(rng: np.random.Generator, event_log: pd.DataFrame, start_dt: st
     ad_type = rng.choice(["video", "banner"], size=n, p=[0.6, 0.4])
     landing_type = rng.choice(["app", "web"], size=n, p=[0.7, 0.3])
 
-    has_product = rng.random(n) < 0.8
-    product_num = rng.integers(1, 5001, size=n)
-    product_id = [f"product_{x:04d}" if hp else "" for x, hp in zip(product_num.tolist(), has_product.tolist())]
+    # product_id (long-tail distribution: hot products + tail products)
+    # - total products: 5000
+    # - top 5% (250) are "hot": product_0001 ~ product_0250, chosen with 60% probability
+    # - the rest are "tail": product_0251 ~ product_5000, chosen with 40% probability
+    # - keep 20% ads without product (empty string) for realism
+    has_product = rng.random(n) >= 0.2
+    pick_hot = rng.random(n) < 0.6
+
+    product_id_arr = np.full(n, "", dtype=object)
+    hot_mask = has_product & pick_hot
+    tail_mask = has_product & (~pick_hot)
+
+    if int(hot_mask.sum()) > 0:
+        hot_nums = rng.integers(1, 251, size=int(hot_mask.sum()))
+        product_id_arr[hot_mask] = [f"product_{x:04d}" for x in hot_nums.tolist()]
+    if int(tail_mask.sum()) > 0:
+        tail_nums = rng.integers(251, 5001, size=int(tail_mask.sum()))
+        product_id_arr[tail_mask] = [f"product_{x:04d}" for x in tail_nums.tolist()]
+
+    product_id = product_id_arr.tolist()
 
     # Make the campaign effective window cover the generation range (with some jitter)
     start_base = _parse_dt(start_dt)
@@ -407,7 +455,7 @@ def _write_csv(df: pd.DataFrame, path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate enhanced ODS CSVs (v2) into data/ods/")
+    parser = argparse.ArgumentParser(description="Generate enhanced ODS CSVs into data/ods/")
     parser.add_argument("--start_dt", default="2026-03-01", help="Start date (YYYY-MM-DD)")
     parser.add_argument("--days", type=int, default=3, help="Number of days to generate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -471,10 +519,8 @@ def main() -> None:
     conv_log, _ = _gen_conversions(rng=rng, event_log=event_log, cvr_map=cvr_map, starting_conv_seq=1, max_delay_minutes=120)
     cost_df = _gen_cost(rng=rng, event_log=event_log, pricing_map=pricing_map)
 
-    # ===================== Enhancement: embed-like fields (append to CSV tail) =====================
-    # session_id: per (dt,user), gap > 30 minutes => new session
+    # ===================== Embedded-like fields (append to CSV tail) =====================
     session_id = _add_session_id(event_log)
-
     ad_slot_id = rng.choice(SLOT_IDS, size=len(event_log))
     page_id = rng.choice(PAGES, size=len(event_log))
 
@@ -495,13 +541,12 @@ def main() -> None:
     event_log_enriched["ip"] = ip
     event_log_enriched["user_agent"] = user_agent
 
-    # ===================== New ODS dimension/config tables =====================
+    # ===================== Dimension/config tables =====================
     ods_user_profile = _gen_user_profile(rng, event_log_enriched, start_dt=args.start_dt)
     ods_ad_meta = _gen_ad_meta(rng, event_log_enriched, start_dt=args.start_dt, end_dt=end_dt_str)
     ods_ad_slot = _gen_ad_slot(rng)
 
     # ===================== Write outputs (compat + dt partition dirs) =====================
-    # 1) Keep original 3 non-partition files (compat existing pipeline)
     event_cols_v1 = [
         "event_id",
         "event_time",
@@ -514,8 +559,8 @@ def main() -> None:
         "event_type",
         "device",
     ]
-    event_cols_v2_tail = ["session_id", "ad_slot_id", "page_id", "is_valid", "ip", "user_agent"]
-    event_cols = event_cols_v1 + event_cols_v2_tail
+    event_cols_tail = ["session_id", "ad_slot_id", "page_id", "is_valid", "ip", "user_agent"]
+    event_cols = event_cols_v1 + event_cols_tail
 
     conv_cols = ["conv_id", "conv_time", "dt", "user_id", "ad_id", "campaign_id", "order_id", "gmv_amount"]
     cost_cols = ["dt", "campaign_id", "cost"]
@@ -536,7 +581,7 @@ def main() -> None:
         ]
     )
 
-    # 2) Additional dt partition directory outputs (do NOT remove root files)
+    # Additional dt partition directory outputs
     for dt, df_day in event_log_enriched.groupby("dt", sort=True):
         dt_dir = out_dir / f"dt={dt}"
         _write_csv(df_day[event_cols], dt_dir / "ods_ad_event_log.csv")
@@ -550,7 +595,7 @@ def main() -> None:
         _write_csv(cost_day[cost_cols], dt_dir / "ods_ad_cost.csv")
         paths_written.append((str(dt_dir / "ods_ad_cost.csv"), len(cost_day)))
 
-    # 3) New ODS dimension/config CSVs (root only)
+    # New dimension/config CSVs (root only)
     p_user = out_dir / "ods_user_profile.csv"
     p_meta = out_dir / "ods_ad_meta.csv"
     p_slot = out_dir / "ods_ad_slot.csv"
@@ -572,7 +617,7 @@ def main() -> None:
     distinct_ads = int(event_log_enriched["ad_id"].nunique())
     distinct_campaigns = int(event_log_enriched["campaign_id"].nunique())
 
-    print("=== ODS v2 generation summary ===")
+    print("=== ODS generation summary ===")
     print(f"Output dir: {out_dir}")
     print(f"Date range: {args.start_dt} .. {end_dt_str} (days={args.days})")
     print(f"Event rows: {len(event_log_enriched):,} (imps={imps:,}, clicks={clks:,}, CTR={ctr:.2%})")
@@ -584,6 +629,27 @@ def main() -> None:
     print("Files written:")
     for p, n in paths_written:
         print(f"- {p} ({n:,} rows)")
+
+    # ===================== Product distribution (from ods_ad_meta.csv) =====================
+    # share = occurrences / all non-empty product_id occurrences
+    if "product_id" in ods_ad_meta.columns:
+        pid = ods_ad_meta["product_id"].fillna("").astype(str)
+        nonempty = pid.ne("")
+        total_nonempty = int(nonempty.sum())
+        distinct_products = int(pid[nonempty].nunique())
+        vc = pid[nonempty].value_counts()
+
+        top10_share = float(vc.iloc[:10].sum() / total_nonempty) if total_nonempty else 0.0
+        top100_share = float(vc.iloc[:100].sum() / total_nonempty) if total_nonempty else 0.0
+
+        print("")
+        print(f"[ProductDist] distinct_products={distinct_products:,}")
+        if total_nonempty:
+            print("[ProductDist] top10_counts:")
+            for k, v in vc.head(10).items():
+                print(f"[ProductDist] - {k}: {int(v)}")
+        print(f"[ProductDist] top10_share={top10_share:.2%}")
+        print(f"[ProductDist] top100_share={top100_share:.2%}")
 
 
 if __name__ == "__main__":
