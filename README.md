@@ -1,6 +1,6 @@
-# Offline Ad Data Warehouse with Hive Metastore, Spark SQL, and PySpark
+# Offline Ad Data Warehouse with Hive Metastore Project
 
-A local offline advertising analytics warehouse built with `Hive Metastore + Spark SQL + PySpark + Parquet`.
+This is a local offline advertising analytics warehouse built with `Hive Metastore + Spark SQL + PySpark + Parquet`.
 
 This project models a realistic ad-data pipeline from raw event ingestion to reporting outputs through a classic `ODS -> DWD -> DWS -> ADS` architecture. It includes fact and dimension ingestion, SQL-first warehouse jobs, a user-tagging module, and a reproducible benchmark for data skew and salting-based optimization.
 
