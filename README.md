@@ -1,4 +1,4 @@
-# Offline Ad Data Warehouse with Hive Metastore Project
+# Offline Advertising Data Warehouse Project
 
 This is a local offline advertising analytics warehouse built with `Hive Metastore + Spark SQL + PySpark + Parquet`.
 
@@ -185,9 +185,6 @@ Observed locally with `20M` rows, `shuffle_partitions=4`, and `salt_buckets=8`:
 - `improvement_ratio = 1.34`
 - The salted run materially reduced partition imbalance and improved runtime
 
-### Benchmark Conclusion
-This benchmark shows two important points:
-
 1. A hot `campaign_id` can create strong partition imbalance, long-tail tasks, and higher resource pressure during aggregation.
 2. Salting + two-stage aggregation is an effective mitigation strategy for hot-key skew, even in a local Spark environment.
 
@@ -303,11 +300,3 @@ PYTHONPATH=. python benchmark/run_campaign_skew_benchmark.py --modes skewed skew
 ├── run_all.sh
 └── README.md
 ```
-
-## Future Extensions
-- Move from local embedded Hive metastore to a distributed Spark / Hive environment
-- Add richer data-quality checks and reconciliation workflows
-- Extend the warehouse with more business domains, attribution logic, and campaign lifecycle metrics
-- Add more benchmark modes, such as skewed joins or skew-aware window computations
-- Add orchestration and scheduling once the project is migrated beyond local development
-
